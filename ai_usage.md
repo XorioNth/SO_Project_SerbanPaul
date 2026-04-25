@@ -48,7 +48,7 @@ strtok is not reentrant. It stores state in a hidden static variable, so two int
 
 What I learned: the method above is safer than strtok. I have learned new stuff about the fucntion strtok, some unsafe things that happne in the background that I wasn't aware of.
 
-Prompt:Write a function in C with the following header:
+Prompt: Write a function in C with the following header:
 int match_condition(Report *r, const char *field, const char *op, const char *value);
 the Report refers to this:
 ```
