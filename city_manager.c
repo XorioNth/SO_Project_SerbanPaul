@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -15,7 +16,8 @@ typedef enum {
     CMD_VIEW,
     CMD_REMOVE,
     CMD_UPDATE,
-    CMD_FILTER
+    CMD_FILTER,
+    CMD_REMOVEDIS
 } CommandType;
 
 typedef struct report {
@@ -130,6 +132,11 @@ void parse_arguments(int argc, char* argv[], current_context* con) {
                     break;
             }
         }
+        else if(strcmp(argv[i], "--remove_district") == 0 && i + 1 < argc){
+            con->cmd_type = CMD_REMOVEDIS;
+            strncpy(con->district, argv[++i], 100);
+            con->district[99] = '\0';
+        }
     }
 }
 
@@ -235,30 +242,30 @@ int verify_system_integrity(const char* district, const char* role, const char* 
             if (S_ISLNK(st_link.st_mode)) {
                 if (stat(link_path, &st_file) == -1) {
                     printf("Dangling link detected for %s\n", link_path);
-                    return 0;
+                    return 1;
                 }
             }
         }
     }
     if (stat(data_path, &st_file) == -1) {
         perror("File is missing");
-        return 0;
+        return 1;
     }
     if (strcmp(role, "manager") == 0) {
         mode_t mask = (action == 'w') ? S_IWUSR : S_IRUSR;
         if (!(st_file.st_mode & mask)) {
             printf("Manager lacks permission %c to perform this operation on file %s\n", action, file_name);
-            return 0;
+            return 1;
         }
     }
     else if (strcmp(role, "inspector") == 0) {
         mode_t mask = (action == 'w') ? S_IWGRP : S_IRGRP;
         if (!(st_file.st_mode & mask)) {
             printf("Inspector lacks permission %c to perform this operation on file %s\n", action, file_name);
-            return 0;
+            return 1;
         }
     }
-    return 1;
+    return 0;
 }
 int list_reports(const char* district) {
     char path[256];
@@ -320,7 +327,7 @@ int view_report(const char* district, int report_id) {
     return 0;
 }
 void write_to_log(current_context* con) {
-    if (!verify_system_integrity(con->district, con->role, "logged_district", 'w')) {
+    if (verify_system_integrity(con->district, con->role, "logged_district", 'w')) {
         return;
     }
     char path[256];
@@ -344,6 +351,7 @@ void write_to_log(current_context* con) {
 int remove_report(const char* district, int report_id) {
     char path[256];
     snprintf(path, sizeof(path), "%s/reports.dat", district);
+    struct stat st_before, st_after;
     if (report_id < 0) {
         printf("Report_id has invalid value\n");
         return 1;
@@ -353,6 +361,7 @@ int remove_report(const char* district, int report_id) {
         perror("Error opening file");
         return 1;
     }
+    stat(path, &st_before);
     report temp;
     int found = 0;
     off_t delete_pos = 0;
@@ -376,8 +385,13 @@ int remove_report(const char* district, int report_id) {
         delete_pos += sizeof(report);
         lseek(f, delete_pos + sizeof(report), SEEK_SET);
     }
-    printf("Succesfully removed report\n");
     ftruncate(f, delete_pos);
+    stat(path, &st_after);
+    if(st_before.st_size - st_after.st_size != sizeof(report)){
+        printf("Unexpected file size after removal\n");
+    }
+    else
+        printf("Report removed succesfully\n");
     close(f);
     return 0;
 }
@@ -506,8 +520,75 @@ int filter_reports(const char* district, char conditions[][100], int count) {
     close(f);
     return 0;
 }
+int remove_district(const char* district){
+    char link_name[256];
+    snprintf(link_name, sizeof(link_name), "active_reports-%s", district);
+    pid_t p = fork();
+    if(p < 0){
+       perror("Fork fail");
+       return 1;
+    }
+    if (p == 0) {
+       execlp("rm", "rm", "-rf", district, NULL);
+       perror(NULL);
+       return 1;
+    }
+    else {
+       waitpid(p, NULL, 0);
+       unlink(link_name);
+    }
+    return 0;
+}
+void notify_monitor(const char* district, const char *user, const char* role){
+    int f = open(".monitor_pid", O_RDONLY);
+    if(f == -1) {
+       char path[256];
+       snprintf(path, sizeof(path), "%s/logged_district", district);
+       int log = open(path, O_WRONLY| O_APPEND);
+       if(log != -1){
+          char msg[256];
+          int len = snprintf(msg, sizeof(msg), "%ld\t%s\t%s\tMonitor could not be found, pid file missing", time(NULL), user, role);
+          write(log, msg, len);
+          close(log);
+       }
+       else{
+            printf("Could not open log file\n");
+       }
+       return;
+    }
+    char pid_str[32];
+    int bytes = read(f, pid_str, sizeof(pid_str) - 1);
+    close(f);
+    pid_str[bytes] = '\0';
+    pid_t monitor_pid = (pid_t)atoi(pid_str);
+    char path[256];
+    snprintf(path, sizeof(path), "%s/logged_district", district);
+    int log = open(path, O_WRONLY | O_APPEND);
+    if(kill(monitor_pid, SIGUSR1) == -1){
+        if(log != -1) {
+            char msg[256];
+            int len = snprintf(msg, sizeof(msg), "%ld\t%s\t%s\tMonitor could not be informed - signal failed\n", time(NULL), user, role);
+            write(log, msg, len);
+            close(log);
+        }
+        else{
+            printf("Could not open log file\n");
+        }
+    }
+    else{
+        if(log != -1){
+            char msg[256];
+            int len = snprintf(msg, sizeof(msg), "%ld\t%s\t%s\tMonitor notified succesfully\n", time(NULL), user, role);
+            write(log, msg, len);
+            close(log);
+        }
+        else{
+            printf("Could not open log file\n");
+        }
+    }
+}
 int main(int argc, char* argv[]) {
-    current_context con = { 0 };
+    current_context con = {0};
     parse_arguments(argc, argv, &con);
     // If the execution was typed incorrectly
     if (con.cmd_type == CMD_NONE || strlen(con.user) == 0 || strlen(con.role) == 0) {
@@ -515,105 +596,126 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     switch (con.cmd_type) {
-    case CMD_ADD: {
-        if (create_file_structure(con.district) == 1)
-            printf("Failed to initialize files. Operation cancelled\n");
-        else if (verify_system_integrity(con.district, con.role, "reports.dat", 'w')) {
-            strcpy(con.cmd_string_conversion, "add");
-            report new_report;
-            memset(&new_report, 0, sizeof(report));
-            read_report_data(&new_report, con.user);
-            // We write to log only if the operation was successful
-            if (write_report_data(&new_report, con.district) == 0)
-                write_to_log(&con);
-        }
-        else {
-            printf("Operation cancelled\n");
-        }
-        break;
-    }
-    case CMD_LIST: {
-        if (verify_system_integrity(con.district, con.role, "reports.dat", 'r')) {
-            strcpy(con.cmd_string_conversion, "list");
-            if (list_reports(con.district) == 0)
-                write_to_log(&con);
-        }
-        else {
-            printf("Operation cancelled\n");
-        }
-        break;
-    }
-    case CMD_VIEW: {
-        if (verify_system_integrity(con.district, con.role, "reports.dat", 'r')) {
-            strcpy(con.cmd_string_conversion, "view");
-            if (view_report(con.district, con.report_id) == 0)
-                write_to_log(&con);
-        }
-        else {
-            printf("Operation cancelled\n");
-        }
-        break;
-    }
-    case CMD_REMOVE: {
-        if (strcmp(con.role, "manager") != 0) {
-            printf("Error: remove_report is restricted to manager only \n");
+        case CMD_ADD: {
+            if (create_file_structure(con.district) == 1)
+                printf("Failed to initialize files. Operation cancelled\n");
+            else if (!verify_system_integrity(con.district, con.role, "reports.dat", 'w')) {
+                strcpy(con.cmd_string_conversion, "add");
+                report new_report;
+                memset(&new_report, 0, sizeof(report));
+                read_report_data(&new_report, con.user);
+                // We write to log only if the operation was successful
+                if (write_report_data(&new_report, con.district) == 0){
+                    write_to_log(&con);
+                    notify_monitor(con.district, con.user, con.role);
+                }
+            }
+            else {
+                printf("Operation cancelled\n");
+            }
             break;
         }
-        if (verify_system_integrity(con.district, con.role, "reports.dat", 'w')) {
-            strcpy(con.cmd_string_conversion, "remove_report");
-            if (remove_report(con.district, con.report_id) == 0)
-                write_to_log(&con);
-        }
-        else {
-            printf("Operation cancelled\n");
-        }
-        break;
-    }
-    case CMD_UPDATE: {
-        if (con.threshold < 1 || con.threshold > 3) {
-            printf("Invalid threshold value, valid ones are 1, 2 or 3\n");
+        case CMD_LIST: {
+            if (!verify_system_integrity(con.district, con.role, "reports.dat", 'r')) {
+                strcpy(con.cmd_string_conversion, "list");
+                if (list_reports(con.district) == 0)
+                    write_to_log(&con);
+            }
+            else {
+                printf("Operation cancelled\n");
+            }
             break;
         }
-        if (strcmp(con.role, "manager") != 0) {
-            printf("Error: update_threshold is restricted to manager only \n");
+        case CMD_VIEW: {
+            if (!verify_system_integrity(con.district, con.role, "reports.dat", 'r')) {
+                strcpy(con.cmd_string_conversion, "view");
+                if (view_report(con.district, con.report_id) == 0)
+                    write_to_log(&con);
+            }
+            else {
+                printf("Operation cancelled\n");
+            }
             break;
         }
-        struct stat st;
-        char cfg_path[256];
-        snprintf(cfg_path, sizeof(cfg_path), "%s/district.cfg", con.district);
-        if (stat(cfg_path, &st) == -1) {
-            perror("cannot stat dsitrict.cfg");
+        case CMD_REMOVE: {
+            if (strcmp(con.role, "manager") != 0) {
+                printf("Error: remove_report is restricted to manager only \n");
+                break;
+            }
+            if (!verify_system_integrity(con.district, con.role, "reports.dat", 'w')) {
+                strcpy(con.cmd_string_conversion, "remove_report");
+                if (remove_report(con.district, con.report_id) == 0)
+                    write_to_log(&con);
+            }
+            else {
+                printf("Operation cancelled\n");
+            }
             break;
         }
-        if ((st.st_mode & 0777) != 0640) {
-            printf("dsitrict.cfg permissions changed, expected 0640, cancelling operation\n");
+        case CMD_UPDATE: {
+            if (con.threshold < 1 || con.threshold > 3) {
+                printf("Invalid threshold value, valid ones are 1, 2 or 3\n");
+                break;
+            }
+            if (strcmp(con.role, "manager") != 0) {
+                printf("Error: update_threshold is restricted to manager only \n");
+                break;
+            }
+            struct stat st;
+            char cfg_path[256];
+            snprintf(cfg_path, sizeof(cfg_path), "%s/district.cfg", con.district);
+            if (stat(cfg_path, &st) == -1) {
+                perror("cannot stat district.cfg");
+                break;
+            }
+            if ((st.st_mode & 0777) != 0640) {
+                printf("district.cfg permissions changed, expected 0640, cancelling operation\n");
+                break;
+            }
+            if (!verify_system_integrity(con.district, con.role, "district.cfg", 'w')) {
+                strcpy(con.cmd_string_conversion, "update_threshold");
+                if (write_threshold_value(con.district, con.threshold) == 0)
+                    write_to_log(&con);
+            }
+            else {
+                printf("Operation cancelled\n");
+            }
             break;
         }
-        if (verify_system_integrity(con.district, con.role, "district.cfg", 'w')) {
-            strcpy(con.cmd_string_conversion, "update_threshold");
-            if (write_threshold_value(con.district, con.threshold) == 0)
-                write_to_log(&con);
+        case CMD_FILTER: {
+            if (!verify_system_integrity(con.district, con.role, "reports.dat", 'r')) {
+                strcpy(con.cmd_string_conversion, "filter");
+                if (filter_reports(con.district, con.conditions, con.condition_count) == 0)
+                    write_to_log(&con);
+            }
+            else {
+                printf("Operation cancelled\n");
+            }
+            break;
         }
-        else {
-            printf("Operation cancelled\n");
+        case CMD_REMOVEDIS: {
+            if (strcmp(con.role, "manager") != 0) {
+                printf("Error: remove_district is restricted to manager only \n");
+                break;
+            }
+            strcpy(con.cmd_string_conversion, "remove_district");
+            struct stat st_file;
+            char data_path[256];
+            snprintf(data_path, sizeof(data_path), "%s", con.district);
+            if (stat(data_path, &st_file) == -1) {
+                perror("File is missing");
+                printf("Unsuccesful removal. Operation cancelled\n");
+                break;
+            }
+            if (remove_district(con.district) == 0){
+                printf("Succesful removal\n");
+            }
+            break;
         }
-        break;
-    }
-    case CMD_FILTER: {
-        if (verify_system_integrity(con.district, con.role, "reports.dat", 'r')) {
-            strcpy(con.cmd_string_conversion, "filter");
-            if (filter_reports(con.district, con.conditions, con.condition_count) == 0)
-                write_to_log(&con);
+        default: {
+            printf("Command not recognized\n");
+            break;
         }
-        else {
-            printf("Operation cancelled\n");
-        }
-        break;
-    }
-    default: {
-        printf("Command not recognized\n");
-        break;
-    }
     }
     return 0;
 }
